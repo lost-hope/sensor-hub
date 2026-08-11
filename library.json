@@ -1,0 +1,8 @@
+{
+  "name": "sensor-hub",
+  "build": {
+    "libArchive": false,
+    "srcFilter": ["+<*>", "-<examples>"]
+  },
+  "dependencies": {}
+}

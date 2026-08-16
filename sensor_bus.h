@@ -42,6 +42,23 @@
  * The hub takes care of publishing "kitchen_temperature" to MQTT (with HA
  * discovery), /json/state and the Info tab. See examples/demo_sensor_provider.cpp
  * for a complete, compilable example (incl. a binary/motion sensor).
+ *
+ * --- Using the bus from a *consumer* usermod ------------------------------
+ *
+ * Any other usermod that wants a sensor reading to react to (e.g. an
+ * animation that speeds up with temperature) can ask the hub for a value by
+ * SensorType instead of tracking a specific provider/name - the hub picks
+ * which registered sensor answers (see getValue() below):
+ *
+ *   void loop() override {
+ *     SensorHub* hub = getSensorHub();
+ *     if (!hub) return;
+ *     float temperature;
+ *     if (hub->getValue(SensorType::Temperature, temperature)) {
+ *       // ... use temperature, regardless of whether it came from a DHT,
+ *       // SHTC3, BME280, ...
+ *     }
+ *   }
  */
 
 #include <Arduino.h>
@@ -112,10 +129,17 @@ class SensorHub : public Usermod {
     // their built-in default.
     // 'precision' is the number of decimal places shown/published for
     // numeric sensors (ignored for binary types); clamped to 6.
+    // 'priority' only matters if another sensor of the same SensorType is
+    // also registered: it decides which one getValue()/getValueBinary()
+    // hand out (lower wins; ties go to whichever registered first). Leave
+    // at the default unless you specifically want to prefer/deprefer this
+    // sensor over another of the same type (e.g. an I2C sensor over a
+    // cheaper GPIO one for the same physical quantity).
     virtual uint8_t registerSensor(const char* name, SensorType type,
                                     const char* unit = nullptr,
                                     const char* deviceClass = nullptr,
-                                    uint8_t precision = 1) = 0;
+                                    uint8_t precision = 1,
+                                    uint8_t priority = 100) = 0;
 
     // Removes a previously registered sensor, e.g. when hardware is no
     // longer present. Publishes "offline" and removes its HA discovery
@@ -136,6 +160,29 @@ class SensorHub : public Usermod {
     // going "unavailable" in Home Assistant. Defaults to available=true
     // when a sensor is registered.
     virtual void setSensorAvailable(uint8_t handle, bool available) = 0;
+
+    // ---- Consumer API: pull a value by quantity, not by name/handle ------
+    //
+    // Lets a *consumer* usermod ask "give me the temperature" without caring
+    // which provider (dht, shtc3, bme280, ...) - or how many of them - are
+    // actually registered. If several sensors share the same SensorType,
+    // the hub answers with whichever one is currently available() and
+    // valid() (has received a reading) with the lowest registerSensor()
+    // 'priority'; ties go to whichever registered first. Returns false (and
+    // leaves 'value' untouched) if no matching sensor currently qualifies.
+    //
+    // Deliberately not handle-based: which physical sensor answers a given
+    // type can change at runtime (e.g. a higher-priority sensor going
+    // offline), so call this fresh whenever you need a reading rather than
+    // caching a handle across loop() calls.
+    virtual bool getValue(SensorType type, float& value) = 0;
+    virtual bool getValueBinary(SensorType type, bool& value) = 0;
+
+    // Same selection as getValue()/getValueBinary(), but returns the
+    // registered name of the sensor that would answer (or currently
+    // answers) that type - handy for logging/UI ("temperature from
+    // 'kitchen_bme280'"). Returns nullptr if none currently qualify.
+    virtual const char* getValueSourceName(SensorType type) = 0;
 };
 
 // Looks up the Sensor Hub usermod. Returns nullptr if it isn't present in

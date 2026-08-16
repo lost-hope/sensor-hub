@@ -23,6 +23,12 @@ a provider calls `registerSensor()` once and `updateSensor()` /
 `updateSensorBinary()` whenever it has a fresh reading. That's the entire
 contract - the provider never needs to know MQTT, JSON or HTML exist.
 
+A third kind of usermod - a **consumer** - can ask the hub for a value by
+*quantity* (`SensorType::Temperature`, `SensorType::Motion`, ...) instead of
+by name, e.g. to drive an animation from "the" ambient temperature without
+caring whether it's a DHT22, SHTC3 or BME280 behind it. See
+["Reading sensor values from another usermod"](#reading-sensor-values-from-another-usermod) below.
+
 ```
  ┌────────────────────┐        registerSensor()        ┌───────────────────┐
  │ Temperature usermod │ ──────────────────────────────▶│                   │
@@ -139,6 +145,55 @@ REGISTER_USERMOD(my_temperature);
 (all numeric), and `Motion` / `Contact` (binary). Use `Generic` /
 `GenericBinary` with an explicit unit/device class for anything else. See
 the doc comments in `sensor_bus.h` for the full API.
+
+## Reading sensor values from another usermod
+
+Besides publishing to MQTT/JSON/Info, the hub also lets any other usermod
+*pull* the current value for a quantity - it doesn't need to know which
+provider (or how many) actually supply it:
+
+```cpp
+#include "wled.h"
+#include "sensor_bus.h"
+
+void loop() {
+  SensorHub* hub = getSensorHub();
+  if (!hub) return;
+
+  float temperature;
+  if (hub->getValue(SensorType::Temperature, temperature)) {
+    // use temperature - could be from a DHT, SHTC3, BME280, ...
+  }
+
+  bool motion;
+  if (hub->getValueBinary(SensorType::Motion, motion)) {
+    // use motion
+  }
+}
+```
+
+If more than one registered sensor shares the same `SensorType` (e.g. a
+DHT22 and a BME280 both reporting `Temperature`), the hub answers with
+whichever one is currently available and has a valid reading, preferring the
+lowest `priority` value passed to its `registerSensor()` call (ties go to
+whichever registered first). Providers default to the same priority, so by
+default the first one to register wins and the query transparently falls
+back to another sensor of the same type if that one goes offline. A provider
+that should be preferred over others of the same type (e.g. a more accurate
+I2C sensor over a cheap GPIO one) can pass a lower `priority` explicitly:
+
+```cpp
+tempHandle = hub->registerSensor("kitchen_temperature", SensorType::Temperature,
+                                  nullptr, nullptr, /*precision=*/1, /*priority=*/10);
+```
+
+`getValueSourceName(type)` returns the registered name of whichever sensor
+would currently answer a given type (or `nullptr` if none qualify) - useful
+for logging or showing "temperature from 'kitchen_bme280'" in a UI.
+
+This lookup is deliberately not handle-based: which physical sensor answers
+a given type can change at runtime, so call it fresh whenever you need a
+reading instead of caching a handle across `loop()` calls.
 
 ### Bundled example providers
 

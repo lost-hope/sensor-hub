@@ -37,6 +37,7 @@ class SensorHubUsermod : public SensorHub {
       char unit[8];
       char deviceClass[24];
       uint8_t precision;
+      uint8_t priority;    // lower wins ties among sensors of the same type in getValue()
       float value;
       bool boolValue;
       bool available;
@@ -136,6 +137,20 @@ class SensorHubUsermod : public SensorHub {
     void publishAvailability(Sensor& s);
     void publishDiscovery(Sensor& s);
     void publishDiscoveryRemoval(Sensor& s);
+
+    // Selects the sensor a getValue()/getValueBinary()/getValueSourceName()
+    // query for 'type' should answer with: lowest 'priority' among used,
+    // available, valid sensors of that type, ties broken by array index
+    // (== registration order). SENSOR_HANDLE_INVALID if none qualify.
+    uint8_t bestSensorOfType(SensorType type) {
+      uint8_t best = SENSOR_HANDLE_INVALID;
+      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
+        Sensor& s = sensors[i];
+        if (!s.used || s.type != type || !s.valid || !s.available) continue;
+        if (best == SENSOR_HANDLE_INVALID || s.priority < sensors[best].priority) best = i;
+      }
+      return best;
+    }
 
   public:
 
@@ -240,7 +255,7 @@ class SensorHubUsermod : public SensorHub {
     // ---- SensorHub bus interface -----------------------------------------
 
     uint8_t registerSensor(const char* name, SensorType type, const char* unit,
-                            const char* deviceClass, uint8_t precision) override {
+                            const char* deviceClass, uint8_t precision, uint8_t priority) override {
       if (!name || !name[0]) return SENSOR_HANDLE_INVALID;
       for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
         if (sensors[i].used && namesEqual(sensors[i].name, name)) return SENSOR_HANDLE_INVALID; // duplicate
@@ -254,6 +269,7 @@ class SensorHubUsermod : public SensorHub {
         strlcpy(s.unit, unit ? unit : defaultUnit(type), sizeof(s.unit));
         strlcpy(s.deviceClass, deviceClass ? deviceClass : defaultDeviceClass(type), sizeof(s.deviceClass));
         s.precision = precision > 6 ? 6 : precision; // clamp: bounds dtostrf() output length in publishState()
+        s.priority = priority;
         s.value = NAN;
         s.boolValue = false;
         s.available = true;
@@ -302,6 +318,29 @@ class SensorHubUsermod : public SensorHub {
       if (s.available == available) return;
       s.available = available;
       publishAvailability(s);
+    }
+
+    // ---- Consumer API: pull a value by quantity --------------------------
+
+    bool getValue(SensorType type, float& value) override {
+      if (sensorTypeIsBinary(type)) return false;
+      uint8_t h = bestSensorOfType(type);
+      if (h == SENSOR_HANDLE_INVALID) return false;
+      value = sensors[h].value;
+      return true;
+    }
+
+    bool getValueBinary(SensorType type, bool& value) override {
+      if (!sensorTypeIsBinary(type)) return false;
+      uint8_t h = bestSensorOfType(type);
+      if (h == SENSOR_HANDLE_INVALID) return false;
+      value = sensors[h].boolValue;
+      return true;
+    }
+
+    const char* getValueSourceName(SensorType type) override {
+      uint8_t h = bestSensorOfType(type);
+      return h == SENSOR_HANDLE_INVALID ? nullptr : sensors[h].name;
     }
 };
 

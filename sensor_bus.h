@@ -124,7 +124,19 @@ class SensorHub : public Usermod {
     // key - keep it short, lowercase, and use '_' instead of spaces/slashes
     // (e.g. "kitchen_motion"). The hub copies it internally, so a stack
     // buffer is fine.
-    // 'unit' / 'deviceClass' are only consulted for SensorType::Generic and
+    // 'unit' is only honored for SensorType::Generic and
+    // SensorType::GenericBinary. For every standard type the hub always
+    // stores values in that type's fixed canonical SI unit (e.g. °C for
+    // Temperature, mm for Distance - see defaultUnit() in
+    // usermod_sensor_hub.cpp) and silently ignores any override here - this
+    // guarantees every sensor of a given SensorType is directly comparable
+    // (notably for getValue()/getValueBinary()) no matter which provider
+    // registered it. If your hardware/library natively reports something
+    // else (e.g. cm), convert to the canonical unit yourself before calling
+    // updateSensor(). Users who want a different *display* unit configure
+    // that once, centrally, on the Sensor Hub itself (e.g. °F, inHg, cm/m/in)
+    // - individual providers never need to know about that.
+    // 'deviceClass' is only consulted for SensorType::Generic and
     // SensorType::GenericBinary - pass nullptr for standard types to use
     // their built-in default.
     // 'precision' is the number of decimal places shown/published for

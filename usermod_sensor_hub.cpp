@@ -30,6 +30,19 @@ class SensorHubUsermod : public SensorHub {
 
   private:
 
+    // Per-quantity Info tab display units (see displayValue() below). Values
+    // are always stored/published to MQTT/HA/JSON in the canonical SI unit
+    // (enforced in registerSensor()) regardless of these settings - only the
+    // Info tab ("u" object in /json/info) renders in the chosen unit, so
+    // automations/HA history reading MQTT or /json/state are never affected
+    // by a user changing their display preference.
+    enum class TempUnit     : uint8_t { Celsius = 0, Fahrenheit = 1 };
+    enum class PressureUnit : uint8_t { HPa = 0, InHg = 1 };
+    enum class DistanceUnit : uint8_t { Millimeters = 0, Centimeters = 1, Meters = 2, Inches = 3 };
+    enum class AccelUnit    : uint8_t { MetersPerSecond2 = 0, G = 1 };
+
+    struct DisplayValue { float value; const char* unit; uint8_t precision; };
+
     struct Sensor {
       bool used;
       char name[24];
@@ -57,11 +70,19 @@ class SensorHubUsermod : public SensorHub {
     String haDiscoveryPrefix = "homeassistant";
     uint16_t publishIntervalS = 300; // heartbeat republish even if unchanged; 0 = only on change
     bool retainMqtt = true;
+    uint8_t tempUnit = (uint8_t)TempUnit::Celsius;
+    uint8_t pressureUnit = (uint8_t)PressureUnit::HPa;
+    uint8_t distanceUnit = (uint8_t)DistanceUnit::Millimeters;
+    uint8_t accelUnit = (uint8_t)AccelUnit::MetersPerSecond2;
 
     static const char _name[];
     static const char _enabled[];
     static const char _haDiscovery[];
     static const char _publishInterval[];
+    static const char _tempUnit[];
+    static const char _pressureUnit[];
+    static const char _distanceUnit[];
+    static const char _accelUnit[];
 
     static bool namesEqual(const char* a, const char* b) {
       while (*a && *b) {
@@ -119,6 +140,46 @@ class SensorHubUsermod : public SensorHub {
         // Acceleration: no standard HA device_class - falls through to "" (plain sensor)
         default:                      return "";
       }
+    }
+
+    // Bumps 'base' precision by 'extra' decimal places, clamped to 6 (same
+    // bound registerSensor() enforces) so a converted value never overflows
+    // the small fixed-size buffers publishState()/addToJsonInfo() assume.
+    static uint8_t bumpPrecision(uint8_t base, uint8_t extra) {
+      uint16_t p = (uint16_t)base + extra;
+      return p > 6 ? 6 : (uint8_t)p;
+    }
+
+    // Converts a sensor's canonical value/precision to the unit the user
+    // configured for its quantity (Info tab display only - see the unit
+    // fields above). Falls through to the canonical value/unit/precision
+    // unchanged for binary types, Generic/GenericBinary, and whenever the
+    // configured unit *is* the canonical one.
+    DisplayValue displayValue(const Sensor& s) const {
+      switch (s.type) {
+        case SensorType::Temperature:
+          if ((TempUnit)tempUnit == TempUnit::Fahrenheit)
+            return { s.value * 9.0f / 5.0f + 32.0f, "°F", s.precision };
+          break;
+        case SensorType::Pressure:
+          if ((PressureUnit)pressureUnit == PressureUnit::InHg)
+            return { s.value * 0.0295299830714f, "inHg", bumpPrecision(s.precision, 1) };
+          break;
+        case SensorType::Distance:
+          switch ((DistanceUnit)distanceUnit) {
+            case DistanceUnit::Centimeters: return { s.value / 10.0f,   "cm", bumpPrecision(s.precision, 1) };
+            case DistanceUnit::Meters:      return { s.value / 1000.0f, "m",  bumpPrecision(s.precision, 2) };
+            case DistanceUnit::Inches:      return { s.value / 25.4f,   "in", bumpPrecision(s.precision, 1) };
+            default: break; // Millimeters - canonical, nothing to convert
+          }
+          break;
+        case SensorType::Acceleration:
+          if ((AccelUnit)accelUnit == AccelUnit::G)
+            return { s.value / 9.80665f, "g", s.precision };
+          break;
+        default: break;
+      }
+      return { s.value, s.unit, s.precision };
     }
 
     void stateTopic(const Sensor& s, char* buf, size_t len) {
@@ -184,9 +245,10 @@ class SensorHubUsermod : public SensorHub {
         if (sensorTypeIsBinary(s.type)) {
           arr.add(s.boolValue ? F("on") : F("off"));
         } else {
-          float rounded = roundf(s.value * powf(10, s.precision)) / powf(10, s.precision);
+          DisplayValue dv = displayValue(s);
+          float rounded = roundf(dv.value * powf(10, dv.precision)) / powf(10, dv.precision);
           arr.add(rounded);
-          if (s.unit[0]) arr.add(s.unit);
+          if (dv.unit[0]) arr.add(dv.unit);
         }
       }
     }
@@ -219,6 +281,10 @@ class SensorHubUsermod : public SensorHub {
       top[F("haPrefix")] = haDiscoveryPrefix;
       top[FPSTR(_publishInterval)] = publishIntervalS;
       top[F("retain")] = retainMqtt;
+      top[FPSTR(_tempUnit)] = tempUnit;
+      top[FPSTR(_pressureUnit)] = pressureUnit;
+      top[FPSTR(_distanceUnit)] = distanceUnit;
+      top[FPSTR(_accelUnit)] = accelUnit;
     }
 
     bool readFromConfig(JsonObject& root) override {
@@ -229,6 +295,10 @@ class SensorHubUsermod : public SensorHub {
       configComplete &= getJsonValue(top[F("haPrefix")], haDiscoveryPrefix);
       configComplete &= getJsonValue(top[FPSTR(_publishInterval)], publishIntervalS);
       configComplete &= getJsonValue(top[F("retain")], retainMqtt);
+      configComplete &= getJsonValue(top[FPSTR(_tempUnit)], tempUnit);
+      configComplete &= getJsonValue(top[FPSTR(_pressureUnit)], pressureUnit);
+      configComplete &= getJsonValue(top[FPSTR(_distanceUnit)], distanceUnit);
+      configComplete &= getJsonValue(top[FPSTR(_accelUnit)], accelUnit);
       return configComplete;
     }
 
@@ -236,6 +306,14 @@ class SensorHubUsermod : public SensorHub {
       settingsScript.print(F("addInfo('SensorHub:haPrefix',1,'Home Assistant MQTT discovery topic prefix');"));
       settingsScript.print(F("addInfo('SensorHub:publishInterval',1,'seconds between heartbeat republishes of an unchanged value, 0=off');"));
       settingsScript.print(F("addInfo('SensorHub:retain',1,'retain MQTT sensor state messages');"));
+      settingsScript.print(F("dd=addDropdown('SensorHub','tempUnit');addOption(dd,'°C',0);addOption(dd,'°F',1);"));
+      settingsScript.print(F("addInfo('SensorHub:tempUnit',1,'Info tab display unit only - MQTT/Home Assistant/JSON API always report °C');"));
+      settingsScript.print(F("dd=addDropdown('SensorHub','pressureUnit');addOption(dd,'hPa',0);addOption(dd,'inHg',1);"));
+      settingsScript.print(F("addInfo('SensorHub:pressureUnit',1,'Info tab display unit only - MQTT/Home Assistant/JSON API always report hPa');"));
+      settingsScript.print(F("dd=addDropdown('SensorHub','distanceUnit');addOption(dd,'mm',0);addOption(dd,'cm',1);addOption(dd,'m',2);addOption(dd,'in',3);"));
+      settingsScript.print(F("addInfo('SensorHub:distanceUnit',1,'Info tab display unit only - MQTT/Home Assistant/JSON API always report mm');"));
+      settingsScript.print(F("dd=addDropdown('SensorHub','accelUnit');addOption(dd,'m/s²',0);addOption(dd,'g',1);"));
+      settingsScript.print(F("addInfo('SensorHub:accelUnit',1,'Info tab display unit only - MQTT/Home Assistant/JSON API always report m/s²');"));
     }
 
     void onMqttConnect(bool sessionPresent) override {
@@ -266,7 +344,12 @@ class SensorHubUsermod : public SensorHub {
         s.used = true;
         strlcpy(s.name, name, sizeof(s.name));
         s.type = type;
-        strlcpy(s.unit, unit ? unit : defaultUnit(type), sizeof(s.unit));
+        // 'unit' override only honored for Generic/GenericBinary (see
+        // sensor_bus.h) - every standard type always stores its fixed
+        // canonical unit, so getValue()/getValueBinary() never mix units
+        // across providers of the same SensorType.
+        bool customUnitAllowed = type == SensorType::Generic || type == SensorType::GenericBinary;
+        strlcpy(s.unit, (customUnitAllowed && unit) ? unit : defaultUnit(type), sizeof(s.unit));
         strlcpy(s.deviceClass, deviceClass ? deviceClass : defaultDeviceClass(type), sizeof(s.deviceClass));
         s.precision = precision > 6 ? 6 : precision; // clamp: bounds dtostrf() output length in publishState()
         s.priority = priority;
@@ -348,6 +431,10 @@ const char SensorHubUsermod::_name[]            PROGMEM = "SensorHub";
 const char SensorHubUsermod::_enabled[]         PROGMEM = "enabled";
 const char SensorHubUsermod::_haDiscovery[]     PROGMEM = "haDiscovery";
 const char SensorHubUsermod::_publishInterval[] PROGMEM = "publishInterval";
+const char SensorHubUsermod::_tempUnit[]        PROGMEM = "tempUnit";
+const char SensorHubUsermod::_pressureUnit[]    PROGMEM = "pressureUnit";
+const char SensorHubUsermod::_distanceUnit[]    PROGMEM = "distanceUnit";
+const char SensorHubUsermod::_accelUnit[]       PROGMEM = "accelUnit";
 
 
 // ---- MQTT implementation (no-op when WLED_DISABLE_MQTT is set) ------------

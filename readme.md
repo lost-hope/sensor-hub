@@ -234,6 +234,38 @@ Every sensor is also exposed via:
 | HA discovery prefix | `homeassistant` | Change if your HA instance uses a non-default discovery prefix |
 | Publish interval | 300s | Heartbeat: republish the current value even if unchanged (0 = only publish on change) |
 | Retain | on | Retain MQTT state/availability messages |
+| Temperature unit | °C | Info tab display only - see [below](#display-units-info-tab-only) |
+| Pressure unit | hPa | Info tab display only |
+| Distance unit | mm | Info tab display only |
+| Acceleration unit | m/s² | Info tab display only |
+
+### Display units (Info tab only)
+
+Every provider always pushes readings to the hub in a fixed canonical SI
+unit per `SensorType` (°C, hPa, mm, m/s², ...) - this is enforced by the hub
+itself (`registerSensor()` ignores any `unit` override for standard types),
+so two providers of the same `SensorType` are always directly comparable,
+notably for [`getValue()`](#reading-sensor-values-from-another-usermod).
+
+**MQTT, Home Assistant discovery and `/json/state` always use that canonical
+unit** - they're a stable contract for automations and HA's long-term
+statistics, which would otherwise break if the unit changed under them.
+
+The four settings above only affect the **Info tab** (`u` object in
+`/json/info`), and are set per quantity rather than one global
+metric/imperial switch, since not every quantity has (or needs) an imperial
+counterpart:
+
+| Quantity | Options | Notes |
+|---|---|---|
+| Temperature | °C, °F | |
+| Pressure | hPa, inHg | inHg is the common US weather-station unit |
+| Distance | mm, cm, m, in | deliberately no decimeter or feet - not units anyone actually reads a sensor value in |
+| Acceleration | m/s², g | `g` (9.80665 m/s²) is the common unit for accelerometer readings |
+
+Humidity/Battery (%), CO2 (ppm) and Voltage/Current/Power/Illuminance have no
+alternate display unit - they're either unit-system-independent or already
+the only unit anyone uses for them.
 
 ## Notes
 

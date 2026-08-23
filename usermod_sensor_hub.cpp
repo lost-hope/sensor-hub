@@ -1,5 +1,6 @@
 #include "wled.h"
 #include "sensor_bus.h"
+#include <vector>
 
 /*
  * Sensor Hub - a central usermod that receives sensor readings from other
@@ -10,10 +11,11 @@
  *   - rows in the WLED web UI Info tab
  *
  * Provider usermods (temperature, motion, humidity, ...) never talk to
- * MQTT/JSON/Info directly - they call registerSensor()/updateSensor() on
- * this hub (looked up via getSensorHub()) instead. This keeps sensor
- * drivers small, reusable, and consistent with each other regardless of
- * who wrote them. See examples/demo_sensor_provider.cpp for a template.
+ * MQTT/JSON/Info directly - they declare their sensors at compile time via
+ * REGISTER_SENSOR_SLOT() and call attachSensor()/updateSensor() on this hub
+ * (looked up via getSensorHub()) instead. This keeps sensor drivers small,
+ * reusable, and consistent with each other regardless of who wrote them.
+ * See examples/demo_sensor_provider.cpp for a template.
  *
  * Why not WLED's built-in getUMData()/um_data_t exchange mechanism?
  * getUMData() is a pull-based, one-slot-per-usermod mechanism (a usermod
@@ -24,7 +26,15 @@
  * file) is a better match, following the same "lookup by usermod ID, cast
  * to a known interface" pattern WLED usermods already use for e.g. the
  * four-line-display usermod.
+ *
+ * Sensor table sizing: DECLARE_DYNARRAY(SensorSlotDescriptor, sensorSlots)
+ * must appear in exactly one translation unit (see dynarray.h) - this is
+ * it. Every provider usermod's REGISTER_SENSOR_SLOT() call (in sensor_bus.h)
+ * just *adds* a member to this same linker-managed array from its own
+ * file, so DYNARRAY_LENGTH(sensorSlots) below is exactly the number of
+ * sensor slots linked into this particular build - no fixed cap.
  */
+DECLARE_DYNARRAY(SensorSlotDescriptor, sensorSlots);
 
 class SensorHubUsermod : public SensorHub {
 
@@ -32,10 +42,10 @@ class SensorHubUsermod : public SensorHub {
 
     // Per-quantity Info tab display units (see displayValue() below). Values
     // are always stored/published to MQTT/HA/JSON in the canonical SI unit
-    // (enforced in registerSensor()) regardless of these settings - only the
-    // Info tab ("u" object in /json/info) renders in the chosen unit, so
-    // automations/HA history reading MQTT or /json/state are never affected
-    // by a user changing their display preference.
+    // regardless of these settings - only the Info tab ("u" object in
+    // /json/info) renders in the chosen unit, so automations/HA history
+    // reading MQTT or /json/state are never affected by a user changing
+    // their display preference.
     enum class TempUnit     : uint8_t { Celsius = 0, Fahrenheit = 1 };
     enum class PressureUnit : uint8_t { HPa = 0, InHg = 1 };
     enum class DistanceUnit : uint8_t { Millimeters = 0, Centimeters = 1, Meters = 2, Inches = 3 };
@@ -46,7 +56,7 @@ class SensorHubUsermod : public SensorHub {
     struct Sensor {
       bool used;
       char name[24];
-      SensorType type;
+      const SensorTypeInfo* type;
       char unit[8];
       char deviceClass[24];
       uint8_t precision;
@@ -60,7 +70,13 @@ class SensorHubUsermod : public SensorHub {
       unsigned long lastPublish;
     };
 
-    Sensor sensors[SENSOR_HUB_MAX_SENSORS];
+    // Sized once in setup() from DYNARRAY_LENGTH(sensorSlots) - one entry
+    // per compile-time-declared slot across every linked-in provider, never
+    // grown/shrunk afterwards. Index i always corresponds to
+    // sensorSlots_begin[i]; 'used' distinguishes a slot no provider has
+    // attached (yet, or ever, e.g. its provider's pins are unconfigured)
+    // from one that has.
+    std::vector<Sensor> sensors;
 
     bool enabled = true;
     bool initDone = false;
@@ -106,44 +122,8 @@ class SensorHubUsermod : public SensorHub {
       return s;
     }
 
-    static const char* defaultUnit(SensorType t) {
-      switch (t) {
-        case SensorType::Temperature: return "°C";
-        case SensorType::Humidity:    return "%";
-        case SensorType::Pressure:    return "hPa";
-        case SensorType::Illuminance: return "lx";
-        case SensorType::VoltageV:    return "V";
-        case SensorType::Battery:     return "%";
-        case SensorType::Co2:         return "ppm";
-        case SensorType::Acceleration:return "m/s²";
-        case SensorType::Distance:    return "mm";
-        case SensorType::Current:     return "A";
-        case SensorType::Power:       return "W";
-        default:                      return "";
-      }
-    }
-
-    static const char* defaultDeviceClass(SensorType t) {
-      switch (t) {
-        case SensorType::Temperature: return "temperature";
-        case SensorType::Humidity:    return "humidity";
-        case SensorType::Pressure:    return "pressure";
-        case SensorType::Illuminance: return "illuminance";
-        case SensorType::VoltageV:    return "voltage";
-        case SensorType::Battery:     return "battery";
-        case SensorType::Co2:         return "carbon_dioxide";
-        case SensorType::Distance:    return "distance";
-        case SensorType::Current:     return "current";
-        case SensorType::Power:       return "power";
-        case SensorType::Motion:      return "motion";
-        case SensorType::Contact:     return "door";
-        // Acceleration: no standard HA device_class - falls through to "" (plain sensor)
-        default:                      return "";
-      }
-    }
-
     // Bumps 'base' precision by 'extra' decimal places, clamped to 6 (same
-    // bound registerSensor() enforces) so a converted value never overflows
+    // bound attachSensor() enforces) so a converted value never overflows
     // the small fixed-size buffers publishState()/addToJsonInfo() assume.
     static uint8_t bumpPrecision(uint8_t base, uint8_t extra) {
       uint16_t p = (uint16_t)base + extra;
@@ -153,31 +133,26 @@ class SensorHubUsermod : public SensorHub {
     // Converts a sensor's canonical value/precision to the unit the user
     // configured for its quantity (Info tab display only - see the unit
     // fields above). Falls through to the canonical value/unit/precision
-    // unchanged for binary types, Generic/GenericBinary, and whenever the
-    // configured unit *is* the canonical one.
+    // unchanged for binary types, ad-hoc/custom types, and whenever the
+    // configured unit *is* the canonical one. Matches by SensorTypeInfo::id
+    // string, not object identity - see sensor_bus.h.
     DisplayValue displayValue(const Sensor& s) const {
-      switch (s.type) {
-        case SensorType::Temperature:
-          if ((TempUnit)tempUnit == TempUnit::Fahrenheit)
-            return { s.value * 9.0f / 5.0f + 32.0f, "°F", s.precision };
-          break;
-        case SensorType::Pressure:
-          if ((PressureUnit)pressureUnit == PressureUnit::InHg)
-            return { s.value * 0.0295299830714f, "inHg", bumpPrecision(s.precision, 1) };
-          break;
-        case SensorType::Distance:
-          switch ((DistanceUnit)distanceUnit) {
-            case DistanceUnit::Centimeters: return { s.value / 10.0f,   "cm", bumpPrecision(s.precision, 1) };
-            case DistanceUnit::Meters:      return { s.value / 1000.0f, "m",  bumpPrecision(s.precision, 2) };
-            case DistanceUnit::Inches:      return { s.value / 25.4f,   "in", bumpPrecision(s.precision, 1) };
-            default: break; // Millimeters - canonical, nothing to convert
-          }
-          break;
-        case SensorType::Acceleration:
-          if ((AccelUnit)accelUnit == AccelUnit::G)
-            return { s.value / 9.80665f, "g", s.precision };
-          break;
-        default: break;
+      if (strcmp(s.type->id, SensorTypes::Temperature.id) == 0) {
+        if ((TempUnit)tempUnit == TempUnit::Fahrenheit)
+          return { s.value * 9.0f / 5.0f + 32.0f, "°F", s.precision };
+      } else if (strcmp(s.type->id, SensorTypes::Pressure.id) == 0) {
+        if ((PressureUnit)pressureUnit == PressureUnit::InHg)
+          return { s.value * 0.0295299830714f, "inHg", bumpPrecision(s.precision, 1) };
+      } else if (strcmp(s.type->id, SensorTypes::Distance.id) == 0) {
+        switch ((DistanceUnit)distanceUnit) {
+          case DistanceUnit::Centimeters: return { s.value / 10.0f,   "cm", bumpPrecision(s.precision, 1) };
+          case DistanceUnit::Meters:      return { s.value / 1000.0f, "m",  bumpPrecision(s.precision, 2) };
+          case DistanceUnit::Inches:      return { s.value / 25.4f,   "in", bumpPrecision(s.precision, 1) };
+          default: break; // Millimeters - canonical, nothing to convert
+        }
+      } else if (strcmp(s.type->id, SensorTypes::Acceleration.id) == 0) {
+        if ((AccelUnit)accelUnit == AccelUnit::G)
+          return { s.value / 9.80665f, "g", s.precision };
       }
       return { s.value, s.unit, s.precision };
     }
@@ -201,14 +176,15 @@ class SensorHubUsermod : public SensorHub {
 
     // Selects the sensor a getValue()/getValueBinary()/getValueSourceName()
     // query for 'type' should answer with: lowest 'priority' among used,
-    // available, valid sensors of that type, ties broken by array index
-    // (== registration order). SENSOR_HANDLE_INVALID if none qualify.
-    uint8_t bestSensorOfType(SensorType type) {
+    // available, valid sensors of that type (matched by id string), ties
+    // broken by slot index (== link order). SENSOR_HANDLE_INVALID if none
+    // qualify.
+    uint8_t bestSensorOfType(const SensorTypeInfo& type) {
       uint8_t best = SENSOR_HANDLE_INVALID;
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
+      for (size_t i = 0; i < sensors.size(); i++) {
         Sensor& s = sensors[i];
-        if (!s.used || s.type != type || !s.valid || !s.available) continue;
-        if (best == SENSOR_HANDLE_INVALID || s.priority < sensors[best].priority) best = i;
+        if (!s.used || strcmp(s.type->id, type.id) != 0 || !s.valid || !s.available) continue;
+        if (best == SENSOR_HANDLE_INVALID || s.priority < sensors[best].priority) best = (uint8_t)i;
       }
       return best;
     }
@@ -216,15 +192,25 @@ class SensorHubUsermod : public SensorHub {
   public:
 
     void setup() override {
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) sensors[i].used = false;
+      size_t n = (size_t)DYNARRAY_LENGTH(sensorSlots);
+      sensors.clear();
+      sensors.reserve(n);
+      for (size_t i = 0; i < n; i++) {
+        const SensorSlotDescriptor& slot = DYNARRAY_BEGIN(sensorSlots)[i];
+        Sensor s{};
+        s.used = false;
+        s.type = slot.type;
+        s.precision = slot.defaultPrecision > 6 ? 6 : slot.defaultPrecision;
+        s.priority = slot.defaultPriority;
+        sensors.push_back(s);
+      }
       initDone = true;
     }
 
     void loop() override {
       if (!enabled || !initDone || !WLED_MQTT_CONNECTED) return;
       unsigned long now = millis();
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
-        Sensor& s = sensors[i];
+      for (Sensor& s : sensors) {
         if (!s.used || !s.valid) continue;
         bool heartbeatDue = publishIntervalS > 0 && (now - s.lastPublish) >= (unsigned long)publishIntervalS * 1000UL;
         if (s.dirty || heartbeatDue) publishState(s);
@@ -234,15 +220,14 @@ class SensorHubUsermod : public SensorHub {
     void addToJsonInfo(JsonObject& root) override {
       JsonObject user = root["u"];
       if (user.isNull()) user = root.createNestedObject("u");
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
-        Sensor& s = sensors[i];
+      for (Sensor& s : sensors) {
         if (!s.used) continue;
         JsonArray arr = user.createNestedArray(s.name);
         if (!s.valid) {
           arr.add(F("n/a"));
           continue;
         }
-        if (sensorTypeIsBinary(s.type)) {
+        if (sensorTypeIsBinary(*s.type)) {
           arr.add(s.boolValue ? F("on") : F("off"));
         } else {
           DisplayValue dv = displayValue(s);
@@ -258,14 +243,13 @@ class SensorHubUsermod : public SensorHub {
       JsonObject mod = root[FPSTR(_name)];
       if (mod.isNull()) mod = root.createNestedObject(FPSTR(_name));
       JsonArray arr = mod.createNestedArray(F("sensors"));
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
-        Sensor& s = sensors[i];
+      for (Sensor& s : sensors) {
         if (!s.used) continue;
         JsonObject o = arr.createNestedObject();
         o[F("name")] = s.name;
         o[F("available")] = s.available;
         if (!s.valid) continue;
-        if (sensorTypeIsBinary(s.type)) {
+        if (sensorTypeIsBinary(*s.type)) {
           o[F("value")] = s.boolValue;
         } else {
           o[F("value")] = roundf(s.value * powf(10, s.precision)) / powf(10, s.precision);
@@ -318,8 +302,7 @@ class SensorHubUsermod : public SensorHub {
 
     void onMqttConnect(bool sessionPresent) override {
       if (!enabled) return;
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
-        Sensor& s = sensors[i];
+      for (Sensor& s : sensors) {
         if (!s.used) continue;
         s.discoverySent = false;
         if (haDiscovery) publishDiscovery(s);
@@ -332,42 +315,45 @@ class SensorHubUsermod : public SensorHub {
 
     // ---- SensorHub bus interface -----------------------------------------
 
-    uint8_t registerSensor(const char* name, SensorType type, const char* unit,
-                            const char* deviceClass, uint8_t precision, uint8_t priority) override {
-      if (!name || !name[0]) return SENSOR_HANDLE_INVALID;
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
-        if (sensors[i].used && namesEqual(sensors[i].name, name)) return SENSOR_HANDLE_INVALID; // duplicate
+    uint8_t attachSensor(const SensorSlotDescriptor* slot, const char* namePrefix,
+                          uint8_t precision, uint8_t priority) override {
+      if (!slot || !namePrefix || !namePrefix[0]) return SENSOR_HANDLE_INVALID;
+
+      // Resolve the slot pointer to its index - it's one of the compile-time
+      // entries setup() pre-populated sensors[] from, in the same order.
+      const SensorSlotDescriptor* base = &DYNARRAY_BEGIN(sensorSlots)[0];
+      ptrdiff_t idx = slot - base;
+      if (idx < 0 || (size_t)idx >= sensors.size()) return SENSOR_HANDLE_INVALID; // slot not known to this hub
+
+      char fullName[sizeof(Sensor::name)];
+      snprintf(fullName, sizeof(fullName), "%s%s", namePrefix, slot->nameSuffix);
+
+      for (size_t i = 0; i < sensors.size(); i++) {
+        if ((ptrdiff_t)i == idx) continue;
+        if (sensors[i].used && namesEqual(sensors[i].name, fullName)) return SENSOR_HANDLE_INVALID; // duplicate
       }
-      for (uint8_t i = 0; i < SENSOR_HUB_MAX_SENSORS; i++) {
-        if (sensors[i].used) continue;
-        Sensor& s = sensors[i];
-        s.used = true;
-        strlcpy(s.name, name, sizeof(s.name));
-        s.type = type;
-        // 'unit' override only honored for Generic/GenericBinary (see
-        // sensor_bus.h) - every standard type always stores its fixed
-        // canonical unit, so getValue()/getValueBinary() never mix units
-        // across providers of the same SensorType.
-        bool customUnitAllowed = type == SensorType::Generic || type == SensorType::GenericBinary;
-        strlcpy(s.unit, (customUnitAllowed && unit) ? unit : defaultUnit(type), sizeof(s.unit));
-        strlcpy(s.deviceClass, deviceClass ? deviceClass : defaultDeviceClass(type), sizeof(s.deviceClass));
-        s.precision = precision > 6 ? 6 : precision; // clamp: bounds dtostrf() output length in publishState()
-        s.priority = priority;
-        s.value = NAN;
-        s.boolValue = false;
-        s.available = true;
-        s.valid = false;
-        s.dirty = false;
-        s.discoverySent = false;
-        s.lastPublish = 0;
-        if (initDone && enabled && haDiscovery) publishDiscovery(s);
-        return i;
-      }
-      return SENSOR_HANDLE_INVALID; // hub full
+
+      Sensor& s = sensors[(size_t)idx];
+      s.used = true;
+      strlcpy(s.name, fullName, sizeof(s.name));
+      s.type = slot->type;
+      strlcpy(s.unit, slot->type->unit ? slot->type->unit : "", sizeof(s.unit));
+      strlcpy(s.deviceClass, slot->type->haDeviceClass ? slot->type->haDeviceClass : "", sizeof(s.deviceClass));
+      s.precision = precision > 6 ? 6 : precision; // clamp: bounds dtostrf() output length in publishState()
+      s.priority = priority;
+      s.value = NAN;
+      s.boolValue = false;
+      s.available = true;
+      s.valid = false;
+      s.dirty = false;
+      s.discoverySent = false;
+      s.lastPublish = 0;
+      if (initDone && enabled && haDiscovery) publishDiscovery(s);
+      return (uint8_t)idx;
     }
 
     void unregisterSensor(uint8_t handle) override {
-      if (handle >= SENSOR_HUB_MAX_SENSORS || !sensors[handle].used) return;
+      if (handle >= sensors.size() || !sensors[handle].used) return;
       Sensor& s = sensors[handle];
       s.available = false;
       publishAvailability(s);
@@ -376,9 +362,9 @@ class SensorHubUsermod : public SensorHub {
     }
 
     void updateSensor(uint8_t handle, float value) override {
-      if (handle >= SENSOR_HUB_MAX_SENSORS || !sensors[handle].used) return;
+      if (handle >= sensors.size() || !sensors[handle].used) return;
       Sensor& s = sensors[handle];
-      if (sensorTypeIsBinary(s.type)) return;
+      if (sensorTypeIsBinary(*s.type)) return;
       bool changed = !s.valid || fabsf(s.value - value) > 0.0001f;
       s.value = value;
       s.valid = true;
@@ -386,9 +372,9 @@ class SensorHubUsermod : public SensorHub {
     }
 
     void updateSensorBinary(uint8_t handle, bool value) override {
-      if (handle >= SENSOR_HUB_MAX_SENSORS || !sensors[handle].used) return;
+      if (handle >= sensors.size() || !sensors[handle].used) return;
       Sensor& s = sensors[handle];
-      if (!sensorTypeIsBinary(s.type)) return;
+      if (!sensorTypeIsBinary(*s.type)) return;
       bool changed = !s.valid || s.boolValue != value;
       s.boolValue = value;
       s.valid = true;
@@ -396,7 +382,7 @@ class SensorHubUsermod : public SensorHub {
     }
 
     void setSensorAvailable(uint8_t handle, bool available) override {
-      if (handle >= SENSOR_HUB_MAX_SENSORS || !sensors[handle].used) return;
+      if (handle >= sensors.size() || !sensors[handle].used) return;
       Sensor& s = sensors[handle];
       if (s.available == available) return;
       s.available = available;
@@ -405,25 +391,34 @@ class SensorHubUsermod : public SensorHub {
 
     // ---- Consumer API: pull a value by quantity --------------------------
 
-    bool getValue(SensorType type, float& value) override {
-      if (sensorTypeIsBinary(type)) return false;
+    bool getValue(const SensorTypeInfo& type, float& value) override {
+      if (type.isBinary) return false;
       uint8_t h = bestSensorOfType(type);
       if (h == SENSOR_HANDLE_INVALID) return false;
       value = sensors[h].value;
       return true;
     }
 
-    bool getValueBinary(SensorType type, bool& value) override {
-      if (!sensorTypeIsBinary(type)) return false;
+    bool getValueBinary(const SensorTypeInfo& type, bool& value) override {
+      if (!type.isBinary) return false;
       uint8_t h = bestSensorOfType(type);
       if (h == SENSOR_HANDLE_INVALID) return false;
       value = sensors[h].boolValue;
       return true;
     }
 
-    const char* getValueSourceName(SensorType type) override {
+    const char* getValueSourceName(const SensorTypeInfo& type) override {
       uint8_t h = bestSensorOfType(type);
       return h == SENSOR_HANDLE_INVALID ? nullptr : sensors[h].name;
+    }
+
+    bool getValueByName(const char* name, float& value) override {
+      if (!name || !name[0]) return false;
+      for (Sensor& s : sensors) {
+        if (!s.used || sensorTypeIsBinary(*s.type) || !s.valid || !s.available) continue;
+        if (namesEqual(s.name, name)) { value = s.value; return true; }
+      }
+      return false;
     }
 };
 
@@ -445,8 +440,8 @@ void SensorHubUsermod::publishState(Sensor& s)
   if (!WLED_MQTT_CONNECTED) return;
   char topic[96];
   stateTopic(s, topic, sizeof(topic));
-  char payload[32]; // precision is clamped to <= 6 in registerSensor(), plenty of headroom here
-  if (sensorTypeIsBinary(s.type)) {
+  char payload[32]; // precision is clamped to <= 6 in attachSensor(), plenty of headroom here
+  if (sensorTypeIsBinary(*s.type)) {
     strcpy(payload, s.boolValue ? "ON" : "OFF");
   } else {
     dtostrf(s.value, 0, s.precision, payload);
@@ -471,7 +466,7 @@ void SensorHubUsermod::publishDiscovery(Sensor& s)
 {
 #ifndef WLED_DISABLE_MQTT
   if (!WLED_MQTT_CONNECTED) return;
-  bool binary = sensorTypeIsBinary(s.type);
+  bool binary = sensorTypeIsBinary(*s.type);
   char stateTopicBuf[96], availTopicBuf[96];
   stateTopic(s, stateTopicBuf, sizeof(stateTopicBuf));
   availabilityTopic(s, availTopicBuf, sizeof(availTopicBuf));
@@ -517,7 +512,7 @@ void SensorHubUsermod::publishDiscoveryRemoval(Sensor& s)
 {
 #ifndef WLED_DISABLE_MQTT
   if (!WLED_MQTT_CONNECTED) return;
-  bool binary = sensorTypeIsBinary(s.type);
+  bool binary = sensorTypeIsBinary(*s.type);
   String discTopic = haDiscoveryPrefix + (binary ? "/binary_sensor/" : "/sensor/") + escapedMac + "/" + slug(s.name) + "/config";
   mqtt->publish(discTopic.c_str(), 0, true, ""); // empty retained payload removes the HA entity
   s.discoverySent = false;

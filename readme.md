@@ -195,6 +195,14 @@ This lookup is deliberately not handle-based: which physical sensor answers
 a given type can change at runtime, so call it fresh whenever you need a
 reading instead of caching a handle across `loop()` calls.
 
+For a specific named sensor rather than "the" sensor of a type - e.g. one
+particular axis of a multi-axis sensor, where several axes legitimately
+share the same `SensorType` - use `getValueByName(name, value)` instead. See
+[`particle-tilt-effect`](../particle-tilt-effect/readme.md)
+for a complete real consumer usermod: it adds a 2D matrix effect that reads
+an accelerometer's axes by name and tilts a WLED particle-system simulation
+with them.
+
 ### Bundled example providers
 
 [`examples/demo_sensor_provider/`](examples/demo_sensor_provider/) and

@@ -17,14 +17,45 @@
  * Include this header *after* "wled.h" (it relies on UsermodManager and
  * Usermod already being declared).
  *
+ * --- Sensor identity: compile-time slots, runtime attachment -------------
+ *
+ * Every sensor a provider will ever expose is declared once, at file
+ * scope, via REGISTER_SENSOR_SLOT() - this places a small constant
+ * descriptor (quantity + name suffix + default precision/priority) into a
+ * WLED "dynarray" (see dynarray.h; the same linker-section mechanism
+ * REGISTER_USERMOD already uses), so the hub's sensor table is sized
+ * exactly to however many slots are actually linked in across every
+ * provider usermod in your build - no fixed cap, nothing to raise via a
+ * build flag as you add sensors.
+ *
+ * A slot's *name* is only half-known at compile time: the suffix (e.g.
+ * "_accel_x") is fixed in the provider's source, but the prefix is a
+ * runtime-configurable Settings field (so e.g. two DHT providers in one
+ * build can be told apart as "kitchen"/"bedroom"). Likewise a slot's
+ * precision/priority are provider Settings, editable live - the
+ * descriptor only carries their compile-time defaults. So a provider still
+ * calls into the hub at runtime, once per sensor, via attachSensor():
+ * this is not "register a sensor" (the slot already reserves that) but
+ * "here is this slot's current prefix/precision/priority" - typically once
+ * per loop() call, guarded the same idempotent way registerSensor() used
+ * to be.
+ *
  * --- Using the bus from a provider usermod -------------------------------
  *
  *   #include "wled.h"
  *   #include "sensor_bus.h"
  *
+ *   // File scope, outside any class - one slot per sensor this provider
+ *   // will ever attach. Precision/priority here are just the compile-time
+ *   // defaults; a provider's own Settings still control the live values
+ *   // passed to attachSensor() below.
+ *   REGISTER_SENSOR_SLOT(_slotTemp, "_temperature", SensorTypes::Temperature, 1, 100);
+ *
  *   class MyTempSensor : public Usermod {
  *     uint8_t handle = SENSOR_HANDLE_INVALID;
  *     SensorHub* hub = nullptr;
+ *     String namePrefix = "kitchen";
+ *     uint8_t precision = 1, priority = 100;
  *
  *     void setup() override {}
  *
@@ -32,7 +63,7 @@
  *       if (!hub) hub = getSensorHub();       // lazy lookup, hub may load after us
  *       if (!hub) return;                     // Sensor Hub usermod not present in this build
  *       if (handle == SENSOR_HANDLE_INVALID) {
- *         handle = hub->registerSensor("kitchen_temperature", SensorType::Temperature);
+ *         handle = hub->attachSensor(&_slotTemp, namePrefix.c_str(), precision, priority);
  *       }
  *       // ... read your sensor on its own schedule, then:
  *       hub->updateSensor(handle, myReading);
@@ -43,18 +74,24 @@
  * discovery), /json/state and the Info tab. See examples/demo_sensor_provider.cpp
  * for a complete, compilable example (incl. a binary/motion sensor).
  *
+ * A sensor that doesn't fit one of the standard SensorTypes below (e.g. raw
+ * gas resistance) isn't a special case - just declare your own
+ * SensorTypeInfo (own id/unit/device_class) next to your slot, local to
+ * your provider file. That's the whole "open set" property: no shared
+ * "Generic" bucket to collide in, no central header to edit.
+ *
  * --- Using the bus from a *consumer* usermod ------------------------------
  *
  * Any other usermod that wants a sensor reading to react to (e.g. an
  * animation that speeds up with temperature) can ask the hub for a value by
- * SensorType instead of tracking a specific provider/name - the hub picks
+ * quantity instead of tracking a specific provider/name - the hub picks
  * which registered sensor answers (see getValue() below):
  *
  *   void loop() override {
  *     SensorHub* hub = getSensorHub();
  *     if (!hub) return;
  *     float temperature;
- *     if (hub->getValue(SensorType::Temperature, temperature)) {
+ *     if (hub->getValue(SensorTypes::Temperature, temperature)) {
  *       // ... use temperature, regardless of whether it came from a DHT,
  *       // SHTC3, BME280, ...
  *     }
@@ -62,6 +99,7 @@
  */
 
 #include <Arduino.h>
+#include "dynarray.h"
 
 // Unique WLED usermod ID for the Sensor Hub. Not part of the official WLED
 // usermod ID list (wled00/const.h) since this is an out-of-tree usermod. If
@@ -72,41 +110,75 @@
 #define USERMOD_ID_SENSOR_HUB 199
 #endif
 
-// Maximum number of sensors the hub can hold at once. Override with a build
-// flag if you have more sensors than this (each slot costs ~70 bytes RAM).
-#ifndef SENSOR_HUB_MAX_SENSORS
-#define SENSOR_HUB_MAX_SENSORS 16
-#endif
-
-// Returned by registerSensor() when registration fails (hub full, no name,
-// or duplicate name) and used to mark a handle as "not registered".
+// Returned by attachSensor() when attachment fails (unknown slot, no name,
+// or a duplicate resulting name) and used to mark a handle as "not
+// attached".
 #define SENSOR_HANDLE_INVALID 0xFF
 
-// The kind of physical quantity a sensor reports. Selects the default unit,
-// decimal precision and Home Assistant device_class used when none are
-// given explicitly in registerSensor(). Motion/Contact/GenericBinary are
-// exposed as MQTT "ON"/"OFF" and a HA binary_sensor instead of a number.
-enum class SensorType : uint8_t {
-  Temperature = 0,  // deg C, HA device_class "temperature"
-  Humidity,         // %, HA device_class "humidity"
-  Pressure,         // hPa, HA device_class "pressure"
-  Illuminance,      // lx, HA device_class "illuminance"
-  VoltageV,         // V, HA device_class "voltage"
-  Battery,          // %, HA device_class "battery"
-  Co2,              // ppm, HA device_class "carbon_dioxide"
-  Acceleration,     // m/s^2, no standard HA device_class (plain numeric sensor)
-  Distance,         // mm, HA device_class "distance"
-  Current,          // A, HA device_class "current"
-  Power,            // W, HA device_class "power"
-  Motion,           // binary, HA device_class "motion"
-  Contact,          // binary, HA device_class "door"
-  Generic,          // numeric value; pass unit/deviceClass explicitly
-  GenericBinary     // on/off value; pass deviceClass explicitly (optional)
+// Identifies a kind of physical quantity by an open-ended string id instead
+// of a fixed enum - any provider can define its own SensorTypeInfo for a
+// quantity that isn't one of the standard ones below (e.g. soil moisture),
+// with no central header edit required. Two sensors are "the same type"
+// (for getValue()/bestSensorOfType() purposes) purely by comparing 'id' as
+// a string, not by object identity - this is what lets independently
+// written providers agree on a shared quantity just by agreeing on its id.
+// 'isBinary' marks quantities exposed as MQTT "ON"/"OFF" and a HA
+// binary_sensor instead of a number (e.g. Motion/Contact).
+struct SensorTypeInfo {
+  const char* id;
+  const char* unit;          // nullptr if the quantity has none (e.g. binary types)
+  const char* haDeviceClass; // nullptr if there's no standard HA device_class
+  bool isBinary;
 };
 
-inline bool sensorTypeIsBinary(SensorType t) {
-  return t == SensorType::Motion || t == SensorType::Contact || t == SensorType::GenericBinary;
+inline bool sensorTypeIsBinary(const SensorTypeInfo& t) { return t.isBinary; }
+
+// Standard quantities, provided so common providers don't have to invent
+// their own id/unit/device_class - each is a header-only 'constexpr'
+// (internal linkage per-TU, same as any const/constexpr namespace-scope
+// variable - no 'inline' needed since this targets C++11, and no separate
+// out-of-line definition exists to keep either way), so a build that never
+// references e.g. SensorTypes::Co2 doesn't pay for it. Two
+// sensors of the same standard type are always directly comparable
+// (matching units), since there's no per-slot override here - a sensor
+// that needs a different unit just isn't this type (declare your own
+// SensorTypeInfo instead, see above).
+namespace SensorTypes {
+  constexpr SensorTypeInfo Temperature {"temperature",  "°C",   "temperature",      false};
+  constexpr SensorTypeInfo Humidity    {"humidity",     "%",    "humidity",         false};
+  constexpr SensorTypeInfo Pressure    {"pressure",     "hPa",  "pressure",         false};
+  constexpr SensorTypeInfo Illuminance {"illuminance",  "lx",   "illuminance",      false};
+  constexpr SensorTypeInfo VoltageV    {"voltage",      "V",    "voltage",          false};
+  constexpr SensorTypeInfo Battery     {"battery",      "%",    "battery",          false};
+  constexpr SensorTypeInfo Co2         {"co2",          "ppm",  "carbon_dioxide",   false};
+  constexpr SensorTypeInfo Acceleration{"acceleration", "m/s²", nullptr,            false}; // no standard HA device_class
+  constexpr SensorTypeInfo Distance    {"distance",     "mm",   "distance",         false};
+  constexpr SensorTypeInfo Current     {"current",      "A",    "current",          false};
+  constexpr SensorTypeInfo Power       {"power",        "W",    "power",            false};
+  constexpr SensorTypeInfo Motion      {"motion",       nullptr,"motion",           true};
+  constexpr SensorTypeInfo Contact     {"contact",      nullptr,"door",              true};
 }
+
+// A compile-time-constant description of one sensor a provider will ever
+// attach - reserved via REGISTER_SENSOR_SLOT() at file scope (see the
+// usage example above), never constructed at runtime. Holds only what's
+// genuinely fixed in every provider's source today; the *name*'s prefix
+// and the live precision/priority remain runtime Settings, supplied when
+// the provider calls attachSensor().
+struct SensorSlotDescriptor {
+  const SensorTypeInfo* type;
+  const char* nameSuffix;   // e.g. "_accel_x"; full sensor name = namePrefix + nameSuffix
+  uint8_t defaultPrecision; // fallback shown before a provider has attached; providers normally pass their own live value to attachSensor()
+  uint8_t defaultPriority;  // ditto
+};
+
+// The dynarray backing every provider's REGISTER_SENSOR_SLOT() calls.
+// DECLARE_DYNARRAY itself must appear in exactly one translation unit (see
+// dynarray.h) - that's usermod_sensor_hub.cpp, not here; every provider
+// file only ever *adds* a member via the macro below.
+#define REGISTER_SENSOR_SLOT(varName, nameSuffix, typeInfo, precision, priority) \
+  DYNARRAY_MEMBER(SensorSlotDescriptor, sensorSlots, varName, 1) = \
+    { &(typeInfo), (nameSuffix), (precision), (priority) }
 
 // Abstract interface implemented by the Sensor Hub usermod. It extends
 // Usermod (rather than standing alone) so that a plain Usermod* obtained
@@ -117,45 +189,32 @@ inline bool sensorTypeIsBinary(SensorType t) {
 // getSensorHub() (below) rather than doing the lookup/cast yourself.
 class SensorHub : public Usermod {
   public:
-    // Registers a new sensor and returns a handle for future updates, or
-    // SENSOR_HANDLE_INVALID if the hub is full or the name is already used.
+    // Attaches to a previously-declared slot (see REGISTER_SENSOR_SLOT
+    // above) and returns a handle for future updates, or
+    // SENSOR_HANDLE_INVALID if the slot pointer is unknown to this hub or
+    // the resulting name (namePrefix + slot's nameSuffix) is already used
+    // by another sensor.
     //
-    // 'name' is used as-is for the MQTT topic segment, HA object_id and JSON
-    // key - keep it short, lowercase, and use '_' instead of spaces/slashes
-    // (e.g. "kitchen_motion"). The hub copies it internally, so a stack
-    // buffer is fine.
-    // 'unit' is only honored for SensorType::Generic and
-    // SensorType::GenericBinary. For every standard type the hub always
-    // stores values in that type's fixed canonical SI unit (e.g. °C for
-    // Temperature, mm for Distance - see defaultUnit() in
-    // usermod_sensor_hub.cpp) and silently ignores any override here - this
-    // guarantees every sensor of a given SensorType is directly comparable
-    // (notably for getValue()/getValueBinary()) no matter which provider
-    // registered it. If your hardware/library natively reports something
-    // else (e.g. cm), convert to the canonical unit yourself before calling
-    // updateSensor(). Users who want a different *display* unit configure
-    // that once, centrally, on the Sensor Hub itself (e.g. °F, inHg, cm/m/in)
-    // - individual providers never need to know about that.
-    // 'deviceClass' is only consulted for SensorType::Generic and
-    // SensorType::GenericBinary - pass nullptr for standard types to use
-    // their built-in default.
+    // The resulting name is used as-is for the MQTT topic segment, HA
+    // object_id and JSON key - keep namePrefix short, lowercase, and use
+    // '_' instead of spaces/slashes (e.g. "kitchen"). The hub copies the
+    // computed name internally, so a stack buffer/temporary is fine.
     // 'precision' is the number of decimal places shown/published for
     // numeric sensors (ignored for binary types); clamped to 6.
-    // 'priority' only matters if another sensor of the same SensorType is
-    // also registered: it decides which one getValue()/getValueBinary()
-    // hand out (lower wins; ties go to whichever registered first). Leave
-    // at the default unless you specifically want to prefer/deprefer this
-    // sensor over another of the same type (e.g. an I2C sensor over a
+    // 'priority' only matters if another sensor of the same quantity is
+    // also attached: it decides which one getValue()/getValueBinary() hand
+    // out (lower wins; ties go to whichever attached first). Leave at the
+    // slot's default unless you specifically want to prefer/deprefer this
+    // sensor over another of the same quantity (e.g. an I2C sensor over a
     // cheaper GPIO one for the same physical quantity).
-    virtual uint8_t registerSensor(const char* name, SensorType type,
-                                    const char* unit = nullptr,
-                                    const char* deviceClass = nullptr,
-                                    uint8_t precision = 1,
-                                    uint8_t priority = 100) = 0;
+    virtual uint8_t attachSensor(const SensorSlotDescriptor* slot, const char* namePrefix,
+                                  uint8_t precision, uint8_t priority) = 0;
 
-    // Removes a previously registered sensor, e.g. when hardware is no
+    // Detaches a previously-attached sensor, e.g. when hardware is no
     // longer present. Publishes "offline" and removes its HA discovery
-    // entry. The handle must not be used again afterwards.
+    // entry. The handle must not be used again afterwards; the underlying
+    // slot itself still exists (it's compile-time-permanent) and may be
+    // re-attached later with a new handle.
     virtual void unregisterSensor(uint8_t handle) = 0;
 
     // Pushes a new numeric reading. No-op for binary sensor types or an
@@ -170,31 +229,43 @@ class SensorHub : public Usermod {
     // Marks a sensor as (un)available, e.g. after repeated read failures or
     // when hardware is temporarily disconnected. Surfaces as the entity
     // going "unavailable" in Home Assistant. Defaults to available=true
-    // when a sensor is registered.
+    // when a sensor is attached.
     virtual void setSensorAvailable(uint8_t handle, bool available) = 0;
 
     // ---- Consumer API: pull a value by quantity, not by name/handle ------
     //
     // Lets a *consumer* usermod ask "give me the temperature" without caring
     // which provider (dht, shtc3, bme280, ...) - or how many of them - are
-    // actually registered. If several sensors share the same SensorType,
-    // the hub answers with whichever one is currently available() and
-    // valid() (has received a reading) with the lowest registerSensor()
-    // 'priority'; ties go to whichever registered first. Returns false (and
-    // leaves 'value' untouched) if no matching sensor currently qualifies.
+    // actually attached. If several sensors share the same quantity
+    // (matched by SensorTypeInfo::id), the hub answers with whichever one
+    // is currently available() and valid() (has received a reading) with
+    // the lowest attachSensor() 'priority'; ties go to whichever attached
+    // first. Returns false (and leaves 'value' untouched) if no matching
+    // sensor currently qualifies.
     //
     // Deliberately not handle-based: which physical sensor answers a given
-    // type can change at runtime (e.g. a higher-priority sensor going
+    // quantity can change at runtime (e.g. a higher-priority sensor going
     // offline), so call this fresh whenever you need a reading rather than
     // caching a handle across loop() calls.
-    virtual bool getValue(SensorType type, float& value) = 0;
-    virtual bool getValueBinary(SensorType type, bool& value) = 0;
+    virtual bool getValue(const SensorTypeInfo& type, float& value) = 0;
+    virtual bool getValueBinary(const SensorTypeInfo& type, bool& value) = 0;
 
     // Same selection as getValue()/getValueBinary(), but returns the
-    // registered name of the sensor that would answer (or currently
-    // answers) that type - handy for logging/UI ("temperature from
+    // attached name of the sensor that would answer (or currently answers)
+    // that quantity - handy for logging/UI ("temperature from
     // 'kitchen_bme280'"). Returns nullptr if none currently qualify.
-    virtual const char* getValueSourceName(SensorType type) = 0;
+    virtual const char* getValueSourceName(const SensorTypeInfo& type) = 0;
+
+    // Looks up one specific sensor by its exact attached name (same
+    // matching as attachSensor()'s duplicate check) and returns its
+    // current numeric value. Prefer getValue(type) when you just want "the"
+    // reading for a quantity and don't care which provider supplies it;
+    // use this when you need a SPECIFIC sensor instead - e.g. one axis of a
+    // multi-axis sensor (several axes legitimately share the same
+    // quantity, so getValue(SensorTypes::Acceleration) can't tell them
+    // apart). Returns false (value untouched) for an unknown name, a binary
+    // sensor, or one that hasn't reported a reading yet / is unavailable.
+    virtual bool getValueByName(const char* name, float& value) = 0;
 };
 
 // Looks up the Sensor Hub usermod. Returns nullptr if it isn't present in
